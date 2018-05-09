@@ -2,15 +2,19 @@ module Main where
 
 import Prelude
 
+import Control.Alt ((<|>))
 import Control.Monad.Aff (delay, launchAff_)
+import Control.Monad.Aff.AVar as AVar
 import Control.Monad.Aff.Bus as Bus
 import Control.Monad.Aff.Class (class MonadAff, liftAff)
 import Control.Monad.Eff (Eff)
 import Control.Monad.Eff.Class (liftEff)
 import Control.Monad.Eff.Console (log)
+import Control.Monad.IO (IO, runIO')
 import Control.Monad.Saga (SagaT)
 import Control.Monad.Saga (put, run, select, takeEvery) as Saga
 import Control.Monad.Saga.Reducer (rootReducer) as Saga
+import Control.MonadZero (guard)
 import Data.Maybe (Maybe(..))
 import Data.Time.Duration (Milliseconds(..))
 
@@ -61,7 +65,42 @@ main = launchAff_ do
   actionBus <- Bus.make
   stateBus <- Bus.make
 
+  runIO' $ Saga.run actionBus stateBus [raceRunner]
+
   let rootReducer = Saga.rootReducer stateBus reduce
-  Saga.run actionBus stateBus [rootReducer, tick, tock]
+  runIO' $ Saga.run actionBus stateBus [rootReducer, tick, tock, guarded]
   Bus.write initState stateBus
   Bus.write (ActionTick 500.0) actionBus
+
+raceRunner :: ∀ s a. SagaT s a IO Unit
+raceRunner = do
+  res <- raceA <|> raceB
+  liftEff $ log $ "race winner " <> res
+
+  where
+  raceA ::SagaT s a IO String
+  raceA = do
+      liftAff $ delay (Milliseconds 1000.0)
+      pure "A"
+
+  raceB :: SagaT s a IO String
+  raceB = do
+      liftAff $ delay (Milliseconds 500.0)
+      pure "B"
+
+guarded :: SagaT State Action IO Unit
+guarded = do
+    cntVar <- liftAff $ AVar.makeVar 0
+    wait <- Saga.takeEvery case _ of
+        ActionTick w -> Just w
+        _ -> Nothing
+    cnt <- liftAff do
+      c <- AVar.takeVar cntVar
+      AVar.putVar (c + 1) cntVar
+      pure (c + 1)
+    
+    guard (cnt > 2)
+
+    inState <- Saga.select _.tickCount
+
+    liftEff $ log $ "Guard finished " <> show inState
