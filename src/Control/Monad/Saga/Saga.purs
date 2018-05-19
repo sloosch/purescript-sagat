@@ -16,30 +16,31 @@ module Control.Monad.Saga (
 
 import Prelude
 
-import Control.Alt (class Alt, (<|>))
+import Control.Alt (class Alt)
 import Control.Alternative (class Alternative, class Plus)
 import Control.Monad.Aff (Canceler(..), Fiber, cancelWith, forkAff)
 import Control.Monad.Aff as Aff
 import Control.Monad.Aff.AVar (AVar)
 import Control.Monad.Aff.AVar as AVar
-import Control.Monad.Aff.Bus (BusRW, BusR')
+import Control.Monad.Aff.Bus (BusR', BusRW)
 import Control.Monad.Aff.Bus as Bus
 import Control.Monad.Aff.Class (class MonadAff, liftAff)
 import Control.Monad.Eff.Class (class MonadEff)
 import Control.Monad.Free.Trans (FreeT, hoistFreeT, liftFreeT)
 import Control.Monad.Free.Trans as Free
-import Control.Monad.IO (IO, runIO, runIO')
+import Control.Monad.IO (IO, runIO')
 import Control.Monad.IO.Class (class MonadIO, liftIO)
 import Control.Monad.IOSync.Class (class MonadIOSync, liftIOSync)
 import Control.Monad.Maybe.Trans (class MonadTrans, lift, runMaybeT)
 import Control.Monad.Reader (ReaderT, ask, mapReaderT, runReaderT)
 import Control.Monad.Rec.Class (class MonadRec)
+import Control.Monad.Saga.ForkPool (ForkPool)
+import Control.Monad.Saga.ForkPool as ForkPool
 import Control.MonadZero (class MonadZero)
 import Data.Either (Either(..), either)
 import Data.Foldable (class Foldable, traverse_)
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe)
 import Data.Newtype (class Newtype, unwrap, wrap)
-
 
 data TakeLatestResult a = Superseded | Latest a
 derive instance functorTakeLatestResult :: Functor (TakeLatestResult)
@@ -63,8 +64,10 @@ derive instance functorSagaF :: Functor (SagaF s action)
 
 type SagaCtx s action = {
   latestState :: AVar s,
-  actionBus :: BusRW action
+  actionBus :: BusRW action,
+  forkPool :: ForkPool IO
 }
+
 newtype SagaT s action m a = SagaT (ReaderT (SagaCtx s action) (FreeT (SagaF s action) m) a)
 derive instance newtypeSagaT :: Newtype (SagaT s action m a) _
 derive newtype instance functorSagaT :: Functor m => Functor (SagaT s action m)
@@ -104,66 +107,82 @@ hoistSaga f (SagaT saga) = SagaT $ mapReaderT (hoistFreeT f) saga
 run :: ∀ a s r z f. Foldable f => BusRW a -> BusR' z s -> f (SagaT s a IO r) -> IO Unit
 run actionBus stateBus sagas = liftAff do
   latestState <- AVar.makeEmptyVar
+  suspended <- AVar.makeEmptyVar
+  forkPool <- ForkPool.bounded top
   let
-    loop = do
+    stateLoop = do
         s <- Bus.read stateBus
         _ <- AVar.tryTakeVar latestState
         AVar.putVar s latestState
-        loop
-  _ <- forkAff loop
-  traverse_ (forkAff <<< runIO' <<< runSagaT {latestState, actionBus}) sagas
+        stateLoop
+  _ <- forkAff stateLoop
+  
+  traverse_ (forkAff <<< runIO' <<< runSagaT {latestState, actionBus, forkPool}) sagas
 
 
 runSagaT :: ∀ a s r. SagaCtx s a -> SagaT s a IO r -> IO r
-runSagaT ctx@{latestState, actionBus} sagat =
- resumeSaga latestState $ runReaderT (unwrap sagat) ctx
+runSagaT sctx sagat =
+ resumeSaga sctx $ runReaderT (unwrap sagat) sctx
 
-  where
-  resumeSaga :: AVar s -> FreeT (SagaF s a) IO r -> IO r
-  resumeSaga var saga = Free.resume saga >>= case _ of
-      Left r -> pure r
-      Right step -> interpret var step
+resumeSaga :: ∀ s a r. SagaCtx s a -> FreeT (SagaF s a) IO r -> IO r
+resumeSaga ctx saga = Free.resume saga >>= case _ of
+    Left r -> pure r
+    Right step -> interpret ctx step
 
-  interpret :: AVar s -> SagaF s a (FreeT (SagaF s a) IO r) -> IO r
-  interpret var (Take matches) = liftAff loop where
-    loop = matches <$> Bus.read actionBus >>= case _ of
-        Just step -> runIO' $ resumeSaga var step
-        Nothing -> loop
-  interpret var (TakeEvery matches) = liftAff loop where
-    loop = matches <$>  Bus.read actionBus >>= case _ of
-        Just step -> (forkAff $ runIO' $ resumeSaga var step) *> loop
-        Nothing -> loop
-  interpret var (TakeLatest (TakeLatestF q)) = liftAff do
-    prevProcess <- AVar.makeEmptyVar
-    let loop = do
-          _ <- runMaybeT do
-            step <- wrap $ q.test <$> Bus.read actionBus
-            lift do
-              _ <- runMaybeT do
-                process <- wrap $ AVar.tryTakeVar prevProcess
-                lift $ Aff.killFiber (Aff.error "[saga] superseded") process
-              newProcess <- forkAff $ (runIO' $ resumeSaga var step) `cancelWith` cancelPath
-              AVar.putVar newProcess prevProcess
-          loop
+interpret :: ∀ s a r. SagaCtx s a -> SagaF s a (FreeT (SagaF s a) IO r) -> IO r
+interpret ctx (Take matches) = loop where
+  loop = do
+    _ <- runMaybeT do
+      step <- wrap $ liftAff $ matches <$> Bus.read ctx.actionBus
+      lift $ resumeSaga ctx step
     loop
-    where
-    cancelPath = Canceler $ const $ void $ runIO' $ resumeSaga var q.cancel    
-    
-  interpret var (Put a step) = (liftAff $ Bus.write a actionBus) *> resumeSaga var step
-  interpret var (Select step) = (step <$> (liftAff $ AVar.readVar var)) >>= resumeSaga var
-  interpret var Never = liftAff Aff.never -- TODO: remove? never gets cancelled and will leak? No guard for sagas!
+interpret ctx (TakeEvery matches) = loop where
+  loop = do
+    _ <- runMaybeT do
+      step <- wrap $ liftAff $ matches <$> Bus.read ctx.actionBus
+      lift $ ForkPool.add ctx.forkPool $ resumeSaga ctx step
+    loop
+interpret ctx (TakeLatest (TakeLatestF q)) = liftAff do
+  prevProcess <- AVar.makeEmptyVar
+  let loop = do
+        _ <- runMaybeT do
+          step <- wrap $ q.test <$> Bus.read ctx.actionBus
+          lift do
+            _ <- runMaybeT do
+              process <- wrap $ AVar.tryTakeVar prevProcess
+              lift $ Aff.killFiber (Aff.error "[saga] superseded") process
+            newProcess <- (runIO' $ ForkPool.add ctx.forkPool $ resumeSaga ctx step) `cancelWith` cancelPath
+            AVar.putVar newProcess prevProcess
+        loop
+  loop
+  where
+  cancelPath = Canceler $ const $ void $ runIO' $ resumeSaga ctx q.cancel    
+  
+interpret ctx (Put a step) = (liftAff $ Bus.write a ctx.actionBus) *> resumeSaga ctx step
+interpret ctx (Select step) = (step <$> (liftAff $ AVar.readVar ctx.latestState)) >>= resumeSaga ctx 
+interpret ctx Never = liftAff Aff.never -- TODO: remove? never gets cancelled and will leak? No guard for sagas!
 
 fork :: ∀ s a m r. MonadAff _ m => SagaT s a IO r -> SagaT s a m (Fiber _ r)
 fork saga = do
   ctx <- SagaT ask
-  liftAff $ forkAff $ runIO $ runSagaT ctx saga
+  liftAff $ runIO' $ ForkPool.add ctx.forkPool $ runSagaT ctx saga
 
 race :: ∀ s a m u v. MonadAff _ m => SagaT s a IO u -> SagaT s a IO v -> SagaT s a m (Either u v)
 race s1 s2 = do
   ctx <- SagaT ask
-  liftAff $ do
-    Aff.sequential $ Aff.parallel (runIO' $ Left <$> runSagaT ctx s1) <|> Aff.parallel (runIO' $ Right <$> runSagaT ctx s2)
-
+  res <- liftAff $ AVar.makeEmptyVar
+  f1 <- fork do
+    r <- s1
+    liftAff $ AVar.putVar (Left r) res
+  f2 <- fork do
+    r <- s2
+    liftAff $ AVar.putVar (Right r) res
+  
+  liftAff do
+    fin <- AVar.takeVar res
+    traverse_ (Aff.killFiber $ Aff.error "[saga] race done") [f1, f2]
+    pure fin
+    
 instance sagaIOAlt :: Alt (SagaT s a IO) where
   alt s1 s2 = do
     res <- race s1 s2
