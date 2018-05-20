@@ -18,7 +18,7 @@ import Prelude
 
 import Control.Alt (class Alt)
 import Control.Alternative (class Alternative, class Plus)
-import Control.Monad.Aff (Canceler(..), Fiber, Milliseconds(..), cancelWith, forkAff)
+import Control.Monad.Aff (Canceler(..), Fiber, cancelWith, forkAff)
 import Control.Monad.Aff as Aff
 import Control.Monad.Aff.AVar (AVar)
 import Control.Monad.Aff.AVar as AVar
@@ -137,7 +137,7 @@ interpret ctx (Take matches) = loop where
 interpret ctx (TakeEvery matches) = loop where
   loop = do
     _ <- runMaybeT do
-      step <- wrap $ matches <$> (liftAff $ Bus.read ctx.actionBus)
+      step <- wrap $ liftAff $ matches <$> Bus.read ctx.actionBus
       lift $ ForkPool.add ctx.forkPool $ resumeSaga ctx step
     loop
 interpret ctx (TakeLatest (TakeLatestF q)) = liftAff do
