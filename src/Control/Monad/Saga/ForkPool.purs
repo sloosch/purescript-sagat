@@ -2,6 +2,7 @@ module Control.Monad.Saga.ForkPool  (
     bounded,
     ForkPool,
     add,
+    block,
     shutdown,
     class NatIso,
     forwards,
@@ -57,7 +58,7 @@ bounded n = liftAff do
             _ <- Aff.forkAff $ Aff.finally fin $ Aff.apathize $ Aff.joinFiber task
 
             loopFork
-    loopFiber <- Aff.forkAff $ Aff.supervise loopFork
+    loopFiber <- Aff.forkAff loopFork
     
     let shutdownImpl = Aff.killFiber (Aff.error "[saga] fork pool shutdown") loopFiber
 
@@ -72,6 +73,9 @@ bounded n = liftAff do
 
 add :: ∀ n e r. ForkPool n -> n r -> n (Fiber e r)
 add (ForkPool f) = f.add
+
+block :: ∀ n r. Applicative n => ForkPool n -> n r -> n r
+block (ForkPool f) n = f.add n *> n
 
 shutdown :: ∀ e n m. MonadAff e m => ForkPool n -> m Unit
 shutdown (ForkPool f) = liftAff f.shutdown

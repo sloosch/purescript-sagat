@@ -18,7 +18,7 @@ import Prelude
 
 import Control.Alt (class Alt)
 import Control.Alternative (class Alternative, class Plus)
-import Control.Monad.Aff (Canceler(..), Fiber, cancelWith, forkAff)
+import Control.Monad.Aff (Canceler(..), Fiber, Milliseconds(..), cancelWith, forkAff)
 import Control.Monad.Aff as Aff
 import Control.Monad.Aff.AVar (AVar)
 import Control.Monad.Aff.AVar as AVar
@@ -39,7 +39,7 @@ import Control.Monad.Saga.ForkPool as ForkPool
 import Control.MonadZero (class MonadZero)
 import Data.Either (Either(..), either)
 import Data.Foldable (class Foldable, traverse_)
-import Data.Maybe (Maybe)
+import Data.Maybe (Maybe(..))
 import Data.Newtype (class Newtype, unwrap, wrap)
 
 data TakeLatestResult a = Superseded | Latest a
@@ -131,15 +131,13 @@ resumeSaga ctx saga = Free.resume saga >>= case _ of
 
 interpret :: ∀ s a r. SagaCtx s a -> SagaF s a (FreeT (SagaF s a) IO r) -> IO r
 interpret ctx (Take matches) = loop where
-  loop = do
-    _ <- runMaybeT do
-      step <- wrap $ liftAff $ matches <$> Bus.read ctx.actionBus
-      lift $ resumeSaga ctx step
-    loop
+  loop = matches <$> (liftAff $ Bus.read ctx.actionBus) >>= case _ of
+    Just step -> resumeSaga ctx step
+    Nothing -> loop
 interpret ctx (TakeEvery matches) = loop where
   loop = do
     _ <- runMaybeT do
-      step <- wrap $ liftAff $ matches <$> Bus.read ctx.actionBus
+      step <- wrap $ matches <$> (liftAff $ Bus.read ctx.actionBus)
       lift $ ForkPool.add ctx.forkPool $ resumeSaga ctx step
     loop
 interpret ctx (TakeLatest (TakeLatestF q)) = liftAff do
@@ -158,7 +156,9 @@ interpret ctx (TakeLatest (TakeLatestF q)) = liftAff do
   where
   cancelPath = Canceler $ const $ void $ runIO' $ resumeSaga ctx q.cancel    
   
-interpret ctx (Put a step) = (liftAff $ Bus.write a ctx.actionBus) *> resumeSaga ctx step
+interpret ctx (Put a step) = liftAff do
+  Bus.write a ctx.actionBus
+  runIO' $ resumeSaga ctx step
 interpret ctx (Select step) = (step <$> (liftAff $ AVar.readVar ctx.latestState)) >>= resumeSaga ctx 
 interpret ctx Never = liftAff Aff.never -- TODO: remove? never gets cancelled and will leak? No guard for sagas!
 
