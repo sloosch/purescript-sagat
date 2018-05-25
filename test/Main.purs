@@ -75,6 +75,10 @@ main = launchAff_ do
   Bus.write initState stateBus
   Bus.write (ActionTick 500.0) actionBus
 
+  Aff.delay (Milliseconds 5000.0)
+  Bus.kill (Aff.error "end") actionBus
+  Bus.kill (Aff.error "end") stateBus
+
 raceRunner :: ∀ s a. SagaT s a IO Unit
 raceRunner = do
   res <- raceA <|> raceB

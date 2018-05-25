@@ -18,7 +18,7 @@ import Prelude
 
 import Control.Alt (class Alt)
 import Control.Alternative (class Alternative, class Plus)
-import Control.Monad.Aff (Canceler(..), Fiber, cancelWith, forkAff)
+import Control.Monad.Aff (Canceler(..), Fiber, cancelWith, forkAff, parallel)
 import Control.Monad.Aff as Aff
 import Control.Monad.Aff.AVar (AVAR, AVar)
 import Control.Monad.Aff.AVar as AVar
@@ -109,61 +109,67 @@ run actionBus stateBus sagas = liftAff do
   suspended <- AVar.makeEmptyVar
   forkPool <- ForkPool.make top
   let
-    stateLoop = do
-        s <- Bus.read stateBus
-        _ <- AVar.tryTakeVar latestState
-        AVar.putVar s latestState
-        stateLoop
+    stateLoop = (Aff.attempt $ Bus.read stateBus) >>= case _ of 
+        Left _ -> pure unit
+        Right s -> do
+          _ <- AVar.tryTakeVar latestState
+          AVar.putVar s latestState
+          stateLoop
   _ <- forkAff stateLoop
   
   traverse_ (forkAff <<< runIO' <<< runSagaT {latestState, actionBus, forkPool}) sagas
 
-
-runSagaT :: ∀ a s r m. Runnable m => SagaCtx s a -> SagaT s a m r -> IO r
+runSagaT :: ∀ a s r m. Runnable m => SagaCtx s a -> SagaT s a m r -> IO (Either Aff.Error r)
 runSagaT sctx sagat =
- resumeSaga sctx $ runReaderT (unwrap $ hoistSagaT runAsIO sagat) sctx
+ resumeSaga $ runReaderT (unwrap $ hoistSagaT runAsIO sagat) sctx
   where
-  resumeSaga :: SagaCtx s a -> FreeT (SagaF s a) IO r -> IO r
-  resumeSaga ctx saga = Free.resume saga >>= case _ of
-      Left r -> pure r
-      Right step -> interpret ctx step
 
-  interpret :: SagaCtx s a -> SagaF s a (FreeT (SagaF s a) IO r) -> IO r
-  interpret ctx (Take matches) = loop where
-    loop = matches <$> (liftAff $ Bus.read ctx.actionBus) >>= case _ of
-      Just step -> resumeSaga ctx step
-      Nothing -> loop
-  interpret ctx (TakeEvery matches) = loop where
-    loop = do
-      _ <- runMaybeT do
-        step <- wrap $ liftAff $ matches <$> Bus.read ctx.actionBus
-        ForkPool.add ctx.forkPool $ resumeSaga ctx step
-      loop
-  interpret ctx (TakeLatest (TakeLatestF q)) = liftAff do
-    prevProcess <- AVar.makeEmptyVar
-    let loop = do
-          _ <- runMaybeT do
-            step <- wrap $ q.test <$> Bus.read ctx.actionBus
-            lift do
-              _ <- runMaybeT do
-                process <- wrap $ AVar.tryTakeVar prevProcess
-                lift $ Aff.killFiber (Aff.error "[saga] superseded") process
-              newProcess <- ForkPool.add ctx.forkPool $ ((runIO' $ resumeSaga ctx step) `cancelWith` cancelPath)
-              AVar.putVar newProcess prevProcess
+  action :: ∀ n. MonadAff _ n => n (Either Aff.Error a)
+  action = liftAff $ Aff.attempt $ Bus.read sctx.actionBus
+
+  actionMatchLoop :: ∀ p n. MonadAff _ n => (a -> Maybe p) -> (p -> n (Either Aff.Error r)) -> n (Either Aff.Error r)
+  actionMatchLoop test f = map test <$> action >>= case _ of
+      Left err -> pure $ Left err 
+      Right res -> case res of
+        Just step -> f step
+        Nothing -> actionMatchLoop test f
+
+  resumeSaga :: FreeT (SagaF s a) IO r -> IO (Either Aff.Error r)
+  resumeSaga saga = Free.resume saga >>= case _ of
+      Left r -> pure $ Right r
+      Right step -> interpret step
+
+  interpret ::SagaF s a (FreeT (SagaF s a) IO r) -> IO (Either Aff.Error r)
+  interpret (Take test) = 
+    actionMatchLoop test resumeSaga
+  interpret (TakeEvery test) = loop where
+    loop = actionMatchLoop test \step -> do
+          _ <- ForkPool.add sctx.forkPool $ resumeSaga step
           loop
+  interpret (TakeLatest (TakeLatestF q)) = liftAff do
+    prevProcess <- AVar.makeEmptyVar
+    let loop = actionMatchLoop q.test \step -> do
+                _ <- runMaybeT do
+                  process <- wrap $ AVar.tryTakeVar prevProcess
+                  lift $ Aff.killFiber (Aff.error "[saga] superseded") process
+                newProcess <- ForkPool.add sctx.forkPool $ (runIO' $ resumeSaga step) `cancelWith` cancelPath
+                AVar.putVar newProcess prevProcess
+                loop
     loop
     where
-    cancelPath = Canceler $ const $ void $ runIO' $ resumeSaga ctx q.cancel    
+    cancelPath = Canceler $ const $ void $ runIO' $ resumeSaga q.cancel    
     
-  interpret ctx (Put a step) = liftAff do
-    Bus.write a ctx.actionBus
-    runIO' $ resumeSaga ctx step
-  interpret ctx (Select step) = do
-    state <- liftAff $ AVar.readVar ctx.latestState
-    resumeSaga ctx $ step state
-  interpret ctx Never = liftAff Aff.never
+  interpret (Put a step) = liftAff do
+    res <- Aff.attempt $ Bus.write a sctx.actionBus
+    case res of
+      Left err -> pure $ Left err
+      Right _ -> runIO' $ resumeSaga step
+  interpret (Select step) = do
+    state <- liftAff $ AVar.readVar sctx.latestState
+    resumeSaga $ step state
+  interpret Never = liftAff Aff.never
 
-fork :: ∀ s a m r n. MonadAff _ m => Runnable n => SagaT s a n r -> SagaT s a m (Fiber _ r)
+fork :: ∀ s a m r n. MonadAff _ m => Runnable n => SagaT s a n r -> SagaT s a m (Fiber _ (Either Aff.Error r))
 fork saga = do
   ctx <- SagaT ask
   ForkPool.add ctx.forkPool $ runSagaT ctx saga
