@@ -4,6 +4,7 @@ import Prelude
 
 import Control.Alt ((<|>))
 import Control.Monad.Aff (Aff, delay, launchAff_)
+import Control.Monad.Aff as Aff
 import Control.Monad.Aff.AVar as AVar
 import Control.Monad.Aff.Bus as Bus
 import Control.Monad.Aff.Class (class MonadAff, liftAff)
@@ -11,8 +12,8 @@ import Control.Monad.Eff (Eff)
 import Control.Monad.Eff.Class (liftEff)
 import Control.Monad.Eff.Console (log)
 import Control.Monad.IO (IO, runIO')
-import Control.Monad.Saga (SagaT)
-import Control.Monad.Saga (put, run, select, takeEvery) as Saga
+import Control.Monad.Saga (SagaT, TakeLatestResult(..))
+import Control.Monad.Saga (put, run, select, takeEvery, takeLatest) as Saga
 import Control.Monad.Saga.Reducer (rootReducer) as Saga
 import Control.Monad.Saga.Runnable (class Runnable)
 import Control.MonadZero (guard)
@@ -35,6 +36,7 @@ initState = {
 reduce :: Action -> State -> State
 reduce (ActionTick _) prev = prev{tickCount = prev.tickCount + 1}
 reduce (ActionTock _) prev = prev{tockCount = prev.tockCount + 1}
+reduce _ s = s
 
 tick :: ∀ m. MonadAff _ m => SagaT State Action m Unit
 tick = do
@@ -69,7 +71,7 @@ main = launchAff_ do
   runIO' $ Saga.run actionBus stateBus [raceRunner]
 
   let rootReducer = Saga.rootReducer stateBus reduce :: SagaT State Action (Aff _) Unit
-  runIO' $ Saga.run actionBus stateBus [rootReducer, tick, tock, guarded]
+  runIO' $ Saga.run actionBus stateBus [rootReducer, tick, tock, guarded, latestTick, latestTock]
   Bus.write initState stateBus
   Bus.write (ActionTick 500.0) actionBus
 
@@ -105,3 +107,28 @@ guarded = do
     inState <- Saga.select _.tickCount
 
     liftEff $ log $ "Guard finished " <> show inState
+
+latestTick :: ∀ s m. MonadAff _ m => SagaT s Action m Unit
+latestTick = do
+  res <- Saga.takeLatest case _ of
+    ActionTick _ -> Just unit
+    _ -> Nothing
+    
+  case res of
+    Superseded -> liftEff $ log "Superseded tick"
+    Latest _ -> do
+      liftAff $ Aff.delay (Milliseconds 10000.0) -- will be always superseded
+      liftEff $ log "latest tick"
+
+latestTock :: ∀ s m. MonadAff _ m => SagaT s Action m Unit
+latestTock = do
+  res <- Saga.takeLatest case _ of
+    ActionTick _ -> Just unit
+    _ -> Nothing
+    
+  case res of
+    Superseded -> liftEff $ log "Superseded tock"
+    Latest _ -> do
+      liftAff $ Aff.delay (Milliseconds 100.0)      
+      liftEff $ log "latest tock"
+

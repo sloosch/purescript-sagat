@@ -148,7 +148,7 @@ runSagaT sctx sagat =
               _ <- runMaybeT do
                 process <- wrap $ AVar.tryTakeVar prevProcess
                 lift $ Aff.killFiber (Aff.error "[saga] superseded") process
-              newProcess <- (ForkPool.add ctx.forkPool $ resumeSaga ctx step) `cancelWith` cancelPath
+              newProcess <- ForkPool.add ctx.forkPool $ ((runIO' $ resumeSaga ctx step) `cancelWith` cancelPath)
               AVar.putVar newProcess prevProcess
           loop
     loop
