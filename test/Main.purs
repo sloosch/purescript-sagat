@@ -3,7 +3,7 @@ module Test.Main where
 import Prelude
 
 import Control.Alt ((<|>))
-import Control.Monad.Aff (delay, launchAff_)
+import Control.Monad.Aff (Aff, delay, launchAff_)
 import Control.Monad.Aff.AVar as AVar
 import Control.Monad.Aff.Bus as Bus
 import Control.Monad.Aff.Class (class MonadAff, liftAff)
@@ -14,6 +14,7 @@ import Control.Monad.IO (IO, runIO')
 import Control.Monad.Saga (SagaT)
 import Control.Monad.Saga (put, run, select, takeEvery) as Saga
 import Control.Monad.Saga.Reducer (rootReducer) as Saga
+import Control.Monad.Saga.Runnable (class Runnable)
 import Control.MonadZero (guard)
 import Data.Maybe (Maybe(..))
 import Data.Time.Duration (Milliseconds(..))
@@ -67,7 +68,7 @@ main = launchAff_ do
 
   runIO' $ Saga.run actionBus stateBus [raceRunner]
 
-  let rootReducer = Saga.rootReducer stateBus reduce
+  let rootReducer = Saga.rootReducer stateBus reduce :: SagaT State Action (Aff _) Unit
   runIO' $ Saga.run actionBus stateBus [rootReducer, tick, tock, guarded]
   Bus.write initState stateBus
   Bus.write (ActionTick 500.0) actionBus
@@ -88,7 +89,7 @@ raceRunner = do
       liftAff $ delay (Milliseconds 500.0)
       pure "B"
 
-guarded :: SagaT State Action IO Unit
+guarded :: ∀ m. MonadAff _ m => Runnable m => SagaT State Action m Unit
 guarded = do
     cntVar <- liftAff $ AVar.makeVar 0
     wait <- Saga.takeEvery case _ of
