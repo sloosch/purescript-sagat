@@ -63,6 +63,9 @@ data SagaF s action a =
   | Never
 derive instance functorSagaF :: Functor (SagaF s action)
 
+newtype LatestState s = LatestState (AVar s)
+
+
 type SagaCtx s action = {
   latestState :: AVar s,
   actionBus :: BusRW action,
