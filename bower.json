@@ -7,11 +7,12 @@
     "output"
   ],
   "dependencies": {
-    "purescript-prelude": "^3.3.0",
-    "purescript-console": "^3.0.0",
-    "purescript-io": "^5.0.0"
+    "purescript-prelude": "^4.0.0",
+    "purescript-aff": "^5.0.0",
+    "purescript-freet": "^4.0.0",
+    "purescript-aff-bus": "https://github.com/sloosch/purescript-aff-bus.git#master"
   },
   "devDependencies": {
-    "purescript-psci-support": "^3.0.0"
+    "purescript-psci-support": "^4.0.0"
   }
 }
