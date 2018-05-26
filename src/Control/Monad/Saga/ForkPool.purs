@@ -25,7 +25,7 @@ make n = do
     pure $ ForkPool {max}
 
 add :: ∀ a m t. Runnable t => MonadAff _ m => ForkPool -> t a -> m (Fiber _ a)
-add (ForkPool {max}) task =liftAff do 
+add (ForkPool {max}) task = liftAff do 
     m <- AVar.takeVar max
     let newConc = m - 1
     let shouldBlock = newConc <= 0

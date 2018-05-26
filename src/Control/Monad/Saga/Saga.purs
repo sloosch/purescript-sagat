@@ -32,7 +32,7 @@ import Control.Monad.IO (INFINITY, IO, runIO')
 import Control.Monad.IO.Class (class MonadIO, liftIO)
 import Control.Monad.IOSync.Class (class MonadIOSync, liftIOSync)
 import Control.Monad.Maybe.Trans (class MonadTrans, lift, runMaybeT)
-import Control.Monad.Reader (ReaderT, ask, mapReaderT, runReaderT)
+import Control.Monad.Reader (ReaderT, ask, local, mapReaderT, runReaderT)
 import Control.Monad.Rec.Class (class MonadRec)
 import Control.Monad.Saga.ForkPool (ForkPool)
 import Control.Monad.Saga.ForkPool as ForkPool
@@ -42,6 +42,7 @@ import Data.Either (Either(..), either)
 import Data.Foldable (class Foldable, traverse_)
 import Data.Maybe (Maybe(..))
 import Data.Newtype (class Newtype, unwrap, wrap)
+
 data TakeLatestResult a = Superseded | Latest a
 derive instance functorTakeLatestResult :: Functor (TakeLatestResult)
 instance showTakeLatestResult :: Show a => Show (TakeLatestResult a) where
@@ -106,7 +107,6 @@ hoistSagaT f (SagaT saga) = SagaT $ mapReaderT (hoistFreeT f) saga
 run :: ∀ m a s r z f. Foldable f => Runnable m => BusRW a -> BusR' z s -> f (SagaT s a m r) -> IO Unit
 run actionBus stateBus sagas = liftAff do
   latestState <- AVar.makeEmptyVar
-  suspended <- AVar.makeEmptyVar
   forkPool <- ForkPool.make top
   let
     stateLoop = (Aff.attempt $ Bus.read stateBus) >>= case _ of 
